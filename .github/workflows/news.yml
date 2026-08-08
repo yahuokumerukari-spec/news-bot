@@ -2,8 +2,8 @@ name: Daily News Summary
 
 on:
   schedule:
-    # UTCで指定するため 22:00 UTC = 日本時間 翌7:00
-    - cron: "0 22 * * *"
+    # UTCで指定するため 20:00 UTC = 日本時間 翌5:00
+    - cron: "0 20 * * *"
   workflow_dispatch: {}  # 手動実行ボタン(テスト用)
 
 jobs:
