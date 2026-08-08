@@ -19,7 +19,7 @@ import requests
 # --- 設定 ---------------------------------------------------------------
 RSS_URL = "https://news.yahoo.co.jp/rss/topics/top-picks.xml"  # 個人利用のみ
 MAX_ARTICLES = 8  # 要約に使う記事数(多すぎるとAPIが重くなるので絞る)
-GEMINI_MODEL = "gemini-3.5-flash"  # 無料枠で使える軽量モデル
+GEMINI_MODEL = "gemini-3.5-flash"  # 無料枠で使える標準モデル(2026年8月時点)
 
 
 def get_headlines() -> list[str]:
