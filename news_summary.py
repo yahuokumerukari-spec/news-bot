@@ -2,8 +2,11 @@
 毎朝のニュース自動要約 → Discord通知 スクリプト
 
 やっていること：
-1. Yahoo!ニュースの「主要トピックス」RSS(個人利用の範囲)を取得
-2. 各記事のタイトルをGemini APIでまとめて要約
+1. Yahoo!ニュースの複数カテゴリRSS(個人利用の範囲)を取得
+   ("主要"カテゴリを必ず含めることで、その日絶対外せない大きな
+   ニュースを取りこぼさないようにしている。芸能・スポーツは除外)
+2. 記事のタイトル+概要をGemini APIに渡し、ビジネスパーソン向けの
+   やや詳しめの箇条書き要約を作らせる
 3. できあがった要約をDiscordのWebhookに送信
 
 必要な環境変数(GitHub Actionsの「Secrets」に設定します):
@@ -17,31 +20,71 @@ import feedparser
 import requests
 
 # --- 設定 ---------------------------------------------------------------
-RSS_URL = "https://news.yahoo.co.jp/rss/topics/top-picks.xml"  # 個人利用のみ
-MAX_ARTICLES = 8  # 要約に使う記事数(多すぎるとAPIが重くなるので絞る)
+# 「主要」は絶対外せない大きなニュースを拾うための保険枠。
+# 芸能(entertainment)・スポーツ(sports)は意図的に含めていない。
+RSS_FEEDS = {
+    "主要": "https://news.yahoo.co.jp/rss/topics/top-picks.xml",
+    "国内": "https://news.yahoo.co.jp/rss/topics/domestic.xml",
+    "経済": "https://news.yahoo.co.jp/rss/topics/business.xml",
+    "国際": "https://news.yahoo.co.jp/rss/topics/world.xml",
+    "IT・科学": "https://news.yahoo.co.jp/rss/topics/it.xml",
+}
+MAX_ARTICLES_PER_FEED = 6  # 各フィードから使う記事数
 GEMINI_MODEL = "gemini-3.5-flash"  # 無料枠で使える標準モデル(2026年8月時点)
 
 
-def get_headlines() -> list[str]:
-    """RSSから記事タイトルを取得する"""
-    feed = feedparser.parse(RSS_URL)
-    if not feed.entries:
+def get_articles() -> list[dict]:
+    """複数のRSSから記事(タイトル+概要)を取得する(タイトル重複は除去)"""
+    articles = []
+    seen_titles = set()
+
+    for category, url in RSS_FEEDS.items():
+        feed = feedparser.parse(url)
+        if not feed.entries:
+            continue
+        for entry in feed.entries[:MAX_ARTICLES_PER_FEED]:
+            if entry.title in seen_titles:
+                continue
+            seen_titles.add(entry.title)
+            articles.append(
+                {
+                    "category": category,
+                    "title": entry.title,
+                    "summary": getattr(entry, "summary", ""),
+                }
+            )
+
+    if not articles:
         raise RuntimeError("RSSからニュースを取得できませんでした")
-    return [entry.title for entry in feed.entries[:MAX_ARTICLES]]
+    return articles
 
 
-def summarize_with_gemini(headlines: list[str], api_key: str) -> str:
-    """Gemini APIでニュース一覧を要約する"""
+def summarize_with_gemini(articles: list[dict], api_key: str) -> str:
+    """Gemini APIでニュース一覧をビジネスパーソン向けに要約する"""
     url = (
         f"https://generativelanguage.googleapis.com/v1beta/models/"
         f"{GEMINI_MODEL}:generateContent?key={api_key}"
     )
 
-    news_list = "\n".join(f"- {title}" for title in headlines)
+    news_list = "\n".join(
+        f"[{a['category']}] {a['title']} — {a['summary']}".strip(" —")
+        for a in articles
+    )
+
     prompt = (
-        "以下は今日の主要ニュースの見出し一覧です。"
-        "日本語で、要点をまとめて5行以内の箇条書きで簡潔に要約してください。"
-        "見出しをそのまま並べるのではなく、内容がひと目で分かるようにしてください。\n\n"
+        "あなたはビジネスパーソン向けの朝刊編集者です。"
+        "以下は複数カテゴリのニュース見出しと概要です。これをもとに、"
+        "毎朝読むだけで『今日押さえておくべきニュース』が分かるブリーフィングを作成してください。\n\n"
+        "条件:\n"
+        "- [主要]タグが付いている記事は、その日の重大ニュースである可能性が高いので"
+        "できる限り優先的に含めること(内容が薄い・重複していると判断した場合のみ除外可)\n"
+        "- 芸能人のゴシップ・恋愛・不倫などの芸能ネタは完全に除外する\n"
+        "- 全体で7〜10トピックを選ぶ(重複や瑣末なネタは除く)\n"
+        "- 1トピックにつき1〜2文で「何が起きたか」＋「なぜ重要か/背景」を書く"
+        "(見出しの言い換えだけで終わらせない)\n"
+        "- 各トピックの先頭に元カテゴリのタグ(【主要】【国内】【経済】【国際】【IT・科学】など)をつける\n"
+        "- 箇条書き形式、日本語、専門用語を使ってよいが簡潔に\n"
+        "- 前置きや締めの挨拶文は不要。箇条書き本体のみ出力する\n\n"
         f"{news_list}"
     )
 
@@ -51,7 +94,7 @@ def summarize_with_gemini(headlines: list[str], api_key: str) -> str:
         ]
     }
 
-    response = requests.post(url, json=payload, timeout=30)
+    response = requests.post(url, json=payload, timeout=60)
     response.raise_for_status()
     data = response.json()
 
@@ -62,11 +105,11 @@ def summarize_with_gemini(headlines: list[str], api_key: str) -> str:
 
 
 def send_to_discord(message: str, webhook_url: str) -> None:
-    """Discordのウェブフックにメッセージを送信する"""
-    # Discordの1メッセージは2000文字制限があるので念のため切る
-    content = message[:1900]
-    response = requests.post(webhook_url, json={"content": content}, timeout=30)
-    response.raise_for_status()
+    """Discordのウェブフックにメッセージを送信する(2000文字制限があるので分割送信)"""
+    chunks = [message[i:i + 1900] for i in range(0, len(message), 1900)] or [message]
+    for chunk in chunks:
+        response = requests.post(webhook_url, json={"content": chunk}, timeout=30)
+        response.raise_for_status()
 
 
 def main() -> None:
@@ -77,10 +120,10 @@ def main() -> None:
         print("環境変数 GEMINI_API_KEY / DISCORD_WEBHOOK_URL が設定されていません", file=sys.stderr)
         sys.exit(1)
 
-    headlines = get_headlines()
-    summary = summarize_with_gemini(headlines, gemini_key)
+    articles = get_articles()
+    summary = summarize_with_gemini(articles, gemini_key)
 
-    message = f"📰 **今日のニュースまとめ**\n\n{summary}"
+    message = f"📰 **今日のニュースブリーフィング**\n\n{summary}"
     send_to_discord(message, discord_webhook)
     print("Discordへの送信が完了しました")
 
